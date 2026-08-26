@@ -1,13 +1,26 @@
 # AnInfo.MailServer
 
-Servidor SMTP local e reutilizável em C#/.NET 8. Recebe SMTP, preserva o MIME, persiste no PostgreSQL, processa uma fila com retry e usa uma entrega segura de desenvolvimento que apenas registra o envio. Não há entrega externa ou relay público nesta etapa.
+Servidor SMTP local e reutilizável em C#/.NET 8. Recebe SMTP somente pelo loopback do notebook, preserva o MIME, persiste no PostgreSQL privado e processa uma fila com retry. Em produção, a saída é feita exclusivamente por um SMTP Relay autenticado; não há entrega direta por MX.
 
 ## Arquitetura
 
 ```text
-Cliente SMTP -> SmtpServer -> MimeKit -> PostgreSQL (Pending)
-                                      -> DeliveryWorker -> DevelopmentMailDeliveryService -> Sent
-GET /health -> aplicação + DbContext PostgreSQL
+Aplicações locais
+        |
+        v
+127.0.0.1:2525
+        |
+        v
+AnInfo.MailServer
+        |
+        v
+PostgreSQL privado
+        |
+        v
+DeliveryWorker -> SmtpRelayDeliveryService
+        |
+        v
+SMTP Relay autenticado -> Internet
 ```
 
 Projetos:
@@ -82,11 +95,11 @@ Para relay, preencha também os placeholders, sem versionar `.env`:
 
 ```dotenv
 DELIVERY_MODE=SmtpRelay
-SMTP_RELAY_HOST=relay.exemplo.com
+SMTP_RELAY_HOST=
 SMTP_RELAY_PORT=587
-SMTP_RELAY_USERNAME=CHANGE_ME
-SMTP_RELAY_PASSWORD=CHANGE_ME
-SMTP_RELAY_FROM_ADDRESS=remetente-autorizado@exemplo.com
+SMTP_RELAY_USERNAME=
+SMTP_RELAY_PASSWORD=
+SMTP_RELAY_FROM_ADDRESS=
 SMTP_RELAY_FROM_NAME=AnInfo Mail Server
 SMTP_RELAY_USE_STARTTLS=true
 SMTP_RELAY_USE_SSL=false
@@ -98,9 +111,26 @@ Portas padrão:
 
 - SMTP: `127.0.0.1:2525`.
 - HTTP/health: `127.0.0.1:8085`.
-- PostgreSQL no Windows: `127.0.0.1:5433` encaminhado ao container `postgres:5432`.
+- PostgreSQL: somente `postgres:5432` na rede privada Docker; não há porta publicada no Windows.
 
-Se uma porta estiver ocupada, altere `POSTGRES_HOST_PORT`, `SMTP_HOST_PORT` ou `HEALTH_HOST_PORT` no `.env`.
+Se uma porta estiver ocupada, altere `SMTP_HOST_PORT` ou `HEALTH_HOST_PORT` no `.env`. Não adicione `ports` ao PostgreSQL.
+
+## Clientes SMTP locais
+
+Uma aplicação executada diretamente no Windows deste notebook, incluindo uma futura integração do RemoteWakeDesk, deve usar:
+
+```text
+SMTP Host: 127.0.0.1
+SMTP Port: 2525
+Use SSL: false
+Authentication: none
+```
+
+Isso é seguro para este cenário porque a publicação Docker está limitada a `127.0.0.1`. O SMTP não deve ser publicado em `0.0.0.0`, exposto pelo Cloudflare, liberado no firewall/roteador ou disponibilizado nas portas 25, 465 ou 587. O bind `0.0.0.0` configurado dentro do container serve apenas para receber o encaminhamento Docker restrito ao loopback do host.
+
+Dentro de outro container, `127.0.0.1` aponta para o próprio container cliente e não para o MailServer. Nesse cenário futuro, conecte ambos a uma rede Docker compartilhada e use o hostname DNS do serviço MailServer e a porta interna `2525`. Essa rede compartilhada não faz parte da configuração atual.
+
+O domínio de identidade é `aninfocloud.com`. Endereços como `remotewakedesk@aninfocloud.com`, `noreply@aninfocloud.com` e `alerts@aninfocloud.com` podem ser autorizados pelo provedor, mas não são hardcoded. O remetente efetivo sempre vem de `SMTP_RELAY_FROM_ADDRESS`.
 
 ## Executar tudo em Docker
 
@@ -126,17 +156,9 @@ Apagar explicitamente containers e dados (destrutivo):
 docker compose down -v
 ```
 
-## Desenvolvimento: Host fora do Docker
+## Conectividade do PostgreSQL
 
-Suba somente o banco:
-
-```powershell
-docker compose up -d postgres
-$env:ConnectionStrings__DefaultConnection = "Host=localhost;Port=5433;Database=aninfo_mail;Username=aninfo;Password=$env:POSTGRES_PASSWORD"
-dotnet run --project .\src\AnInfo.MailServer.Host
-```
-
-Em Docker, o Compose fornece:
+O PostgreSQL não é publicado no host. Em Docker, o Compose fornece ao MailServer:
 
 ```text
 Host=postgres;Port=5432;Database=aninfo_mail;Username=aninfo;Password=<POSTGRES_PASSWORD>
@@ -162,11 +184,9 @@ dotnet tool run dotnet-ef migrations add NomeDaMigration --project .\src\AnInfo.
 
 ## Testes PostgreSQL
 
-O teste cria um banco exclusivo, aplica migrations, inicia o SMTP numa porta efêmera, envia por MailKit, valida a mensagem e remove o banco de teste. Ele não usa serviços externos.
+O teste cria um banco exclusivo, aplica migrations, inicia o SMTP numa porta efêmera, envia por MailKit, valida a mensagem e remove o banco de teste. Ele não usa serviços externos. Como o Compose de produção local mantém o banco privado, a execução pelo Windows exige um PostgreSQL de teste explicitamente disponibilizado para esse fim; não publique o banco do MailServer apenas para executar o teste.
 
 ```powershell
-docker compose up -d postgres
-$env:ANINFO_TEST_POSTGRES = "Host=localhost;Port=5433;Database=postgres;Username=aninfo;Password=$env:POSTGRES_PASSWORD"
 dotnet test
 ```
 
@@ -194,29 +214,9 @@ dotnet run --project .\src\AnInfo.MailServer.TestClient -- `
   --html
 ```
 
-Inspecionar a última mensagem com Npgsql:
-
-```powershell
-$env:MAILSERVER_CONNECTION_STRING = "Host=localhost;Port=5433;Database=aninfo_mail;Username=aninfo;Password=$env:POSTGRES_PASSWORD"
-dotnet run --project .\src\AnInfo.MailServer.TestClient -- --inspect
-```
-
-## DBeaver
-
-Use uma conexão PostgreSQL com:
-
-- Host: `localhost`
-- Port: `5433` (ou `POSTGRES_HOST_PORT` configurada)
-- Database: `aninfo_mail`
-- Username: `aninfo`
-- Password: valor local de `POSTGRES_PASSWORD`
-- SSL: desabilitado somente para este desenvolvimento local.
-
-Em produção, remova a seção `ports` do serviço `postgres`. O banco deve permanecer apenas na rede Docker privada e nunca ser publicado na Internet.
-
 ## Segurança, logs e limitações
 
-SMTP/HTTP/PostgreSQL são publicados apenas em `127.0.0.1` pelo Compose. O bind SMTP `0.0.0.0` ocorre somente dentro do container e exige a opção de desenvolvimento explícita; a porta publicada continua restrita ao loopback do host. Senhas e corpos não são registrados. Logs ficam em `/app/logs` no container e no console (`docker compose logs`).
+SMTP e HTTP são publicados apenas em `127.0.0.1` pelo Compose; PostgreSQL não é publicado. O bind SMTP `0.0.0.0` ocorre somente dentro do container e exige a opção isolada explícita; a segurança depende de manter o binding Docker em `127.0.0.1`. A aplicação também bloqueia SMTP anônimo em interface não-loopback sem essa autorização explícita e bloqueia autenticação sem STARTTLS em interface não-loopback. Nunca altere o binding Docker para uma interface pública sem redesenhar autenticação e TLS. Senhas e corpos não são registrados. Logs ficam em `/app/logs` no container e no console (`docker compose logs`).
 
 Ainda não estão implementados: entrega direta por MX para Gmail/Outlook, DNS, MX, SPF, DKIM, DMARC, porta 25 pública, TLS público, SMTP público ou autenticação pública.
 
