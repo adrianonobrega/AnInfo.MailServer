@@ -35,7 +35,7 @@ jobs:
 
       # ============================================================
       # CONFIGURAR .NET
-      # Lê automaticamente a versão definida no global.json
+      # Lê a versão definida no global.json
       # ============================================================
 
       - name: Configurar .NET SDK
@@ -199,7 +199,7 @@ jobs:
 
       - name: Executar testes
         env:
-          ConnectionStrings__DefaultConnection: "Host=127.0.0.1;Port=5433;Database=aninfo_mail;Username=aninfo"
+          ANINFO_TEST_POSTGRES: "Host=127.0.0.1;Port=5433;Database=postgres;Username=aninfo"
         run: |
           set -e
 
@@ -492,8 +492,6 @@ jobs:
 
       # ============================================================
       # ROLLBACK AUTOMÁTICO
-      # Só acontece se o container chegou a ser implantado
-      # e algum passo posterior falhou.
       # ============================================================
 
       - name: Rollback automático
