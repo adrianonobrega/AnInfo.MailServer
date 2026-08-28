@@ -21,6 +21,7 @@ jobs:
       DEPLOY_DIR: /srv/aninfo/apps/AnInfo.MailServer
       IMAGE_NAME: aninfo-mailserver
       TEST_POSTGRES_CONTAINER: aninfo-mailserver-ci-postgres
+      DOTNET_INSTALL_DIR: /home/adriano/.dotnet
 
     steps:
 
