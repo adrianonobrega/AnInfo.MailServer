@@ -23,16 +23,28 @@ jobs:
       TEST_POSTGRES_CONTAINER: aninfo-mailserver-ci-postgres
 
     steps:
+
       # ============================================================
       # CHECKOUT
       # ============================================================
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
 
       # ============================================================
-      # INFORMAÇÕES DO DEPLOY
+      # CONFIGURAR .NET
+      # Lê automaticamente a versão definida no global.json
+      # ============================================================
+
+      - name: Configurar .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+
+      # ============================================================
+      # INFORMAÇÕES
       # ============================================================
 
       - name: Informações do deploy
@@ -49,47 +61,72 @@ jobs:
 
 
       # ============================================================
-      # VALIDAÇÕES DO SERVIDOR
+      # VALIDAR SERVIDOR
       # ============================================================
 
       - name: Validar ambiente do servidor
         run: |
           set -e
 
-          echo "Verificando Docker..."
-          docker info > /dev/null
+          echo "=============================================="
+          echo "Validando ambiente..."
+          echo "=============================================="
 
-          echo "Verificando Docker Compose..."
+          echo ""
+          echo "Docker:"
+          docker info > /dev/null
+          docker --version
+
+          echo ""
+          echo "Docker Compose:"
           docker compose version
 
-          echo "Verificando .NET..."
+          echo ""
+          echo ".NET SDK:"
           dotnet --version
 
-          echo "Verificando rsync..."
+          echo ""
+          echo ".NET SDKs disponíveis:"
+          dotnet --list-sdks
+
+          echo ""
+          echo "rsync:"
           rsync --version | head -n 1
 
-          echo "Verificando curl..."
+          echo ""
+          echo "curl:"
           curl --version | head -n 1
 
-          echo "Verificando diretório de deploy..."
+          echo ""
+          echo "Diretório de deploy:"
           test -d "$DEPLOY_DIR"
 
-          echo "Verificando arquivo .env..."
+          echo ""
+          echo "Arquivo .env:"
           test -f "$DEPLOY_DIR/.env"
 
-          echo "Verificando permissões do .env..."
           ENV_PERMISSION=$(stat -c "%a" "$DEPLOY_DIR/.env")
 
           if [ "$ENV_PERMISSION" != "600" ]; then
-            echo "ERRO: $DEPLOY_DIR/.env deve possuir permissão 600."
+            echo ""
+            echo "ERRO:"
+            echo "$DEPLOY_DIR/.env deve possuir permissão 600."
             echo "Permissão atual: $ENV_PERMISSION"
             exit 1
           fi
 
-          echo "Verificando rede Docker compartilhada..."
+          echo ".env OK - permissão 600"
+
+          echo ""
+          echo "Rede Docker compartilhada:"
           docker network inspect aninfo_shared > /dev/null
 
+          echo "aninfo_shared OK"
+
+          echo ""
+          echo "=============================================="
           echo "Ambiente validado com sucesso."
+          echo "=============================================="
 
 
       # ============================================================
@@ -111,9 +148,12 @@ jobs:
         run: |
           set -e
 
-          echo "Removendo eventual container antigo de testes..."
-          docker rm -f "$TEST_POSTGRES_CONTAINER" 2>/dev/null || true
+          echo "Removendo eventual PostgreSQL de testes antigo..."
 
+          docker rm -f "$TEST_POSTGRES_CONTAINER" \
+            2>/dev/null || true
+
+          echo ""
           echo "Iniciando PostgreSQL temporário..."
 
           docker run -d \
@@ -124,12 +164,18 @@ jobs:
             -p 127.0.0.1:5433:5432 \
             postgres:17.10-bookworm
 
+          echo ""
           echo "Aguardando PostgreSQL ficar disponível..."
 
           for i in $(seq 1 30); do
-            if docker exec "$TEST_POSTGRES_CONTAINER" \
-              pg_isready -U aninfo -d aninfo_mail > /dev/null 2>&1; then
 
+            if docker exec "$TEST_POSTGRES_CONTAINER" \
+              pg_isready \
+              -U aninfo \
+              -d aninfo_mail \
+              > /dev/null 2>&1; then
+
+              echo ""
               echo "PostgreSQL de testes pronto."
               exit 0
             fi
@@ -138,8 +184,11 @@ jobs:
             sleep 2
           done
 
+          echo ""
           echo "ERRO: PostgreSQL de testes não ficou disponível."
+
           docker logs "$TEST_POSTGRES_CONTAINER" || true
+
           exit 1
 
 
@@ -153,25 +202,36 @@ jobs:
         run: |
           set -e
 
+          echo "=============================================="
+          echo "Executando testes..."
+          echo "=============================================="
+
           dotnet test \
             tests/AnInfo.MailServer.Tests/AnInfo.MailServer.Tests.csproj \
             -c Release \
             --no-restore \
             --verbosity normal
 
+          echo ""
+          echo "=============================================="
+          echo "Testes concluídos com sucesso."
+          echo "=============================================="
+
 
       # ============================================================
-      # LIMPEZA DO POSTGRESQL DE TESTES
+      # REMOVER POSTGRESQL DE TESTES
+      # Executa inclusive se os testes falharem
       # ============================================================
 
       - name: Remover PostgreSQL de testes
         if: always()
         run: |
-          docker rm -f "$TEST_POSTGRES_CONTAINER" 2>/dev/null || true
+          docker rm -f "$TEST_POSTGRES_CONTAINER" \
+            2>/dev/null || true
 
 
       # ============================================================
-      # REGISTRAR VERSÃO ANTERIOR
+      # DESCOBRIR VERSÃO ATUAL
       # ============================================================
 
       - name: Identificar versão anterior
@@ -187,15 +247,22 @@ jobs:
 
           echo "previous_sha=$PREVIOUS_SHA" >> "$GITHUB_OUTPUT"
 
+          echo ""
+          echo "=============================================="
+
           if [ -n "$PREVIOUS_SHA" ]; then
-            echo "Versão atualmente implantada: $PREVIOUS_SHA"
+            echo "Versão atualmente implantada:"
+            echo "$PREVIOUS_SHA"
           else
-            echo "Primeiro deploy detectado."
+            echo "Nenhuma versão anterior registrada."
+            echo "Este será o primeiro deploy."
           fi
+
+          echo "=============================================="
 
 
       # ============================================================
-      # BACKUP DO COMPOSE ANTERIOR
+      # PRESERVAR COMPOSE ANTERIOR PARA ROLLBACK
       # ============================================================
 
       - name: Preservar configuração anterior
@@ -205,20 +272,39 @@ jobs:
           mkdir -p "$DEPLOY_DIR/.rollback"
 
           if [ -f "$DEPLOY_DIR/docker-compose.yml" ]; then
-            cp "$DEPLOY_DIR/docker-compose.yml" \
-               "$DEPLOY_DIR/.rollback/docker-compose.yml"
+
+            cp \
+              "$DEPLOY_DIR/docker-compose.yml" \
+              "$DEPLOY_DIR/.rollback/docker-compose.yml"
+
+            echo "docker-compose.yml anterior preservado."
+
+          else
+
+            echo "Primeiro deploy."
+            echo "Não existe docker-compose.yml anterior."
+
           fi
 
 
       # ============================================================
       # COPIAR NOVA VERSÃO
+      # O .env NÃO É COPIADO NEM APAGADO
       # ============================================================
 
       - name: Atualizar arquivos de deploy
         run: |
           set -e
 
-          echo "Copiando nova versão para:"
+          echo "=============================================="
+          echo "Atualizando arquivos"
+          echo "=============================================="
+
+          echo "Origem:"
+          echo "$GITHUB_WORKSPACE"
+
+          echo ""
+          echo "Destino:"
           echo "$DEPLOY_DIR"
 
           rsync -a \
@@ -233,11 +319,12 @@ jobs:
             --exclude '**/obj/' \
             ./ "$DEPLOY_DIR/"
 
+          echo ""
           echo "Arquivos atualizados."
 
 
       # ============================================================
-      # BUILD VERSIONADO
+      # BUILD DA IMAGEM VERSIONADA
       # ============================================================
 
       - name: Build da imagem
@@ -245,7 +332,11 @@ jobs:
         run: |
           set -e
 
-          echo "Gerando imagem:"
+          echo "=============================================="
+          echo "Build Docker"
+          echo "=============================================="
+
+          echo "Imagem:"
           echo "$IMAGE_NAME:$GITHUB_SHA"
 
           MAILSERVER_IMAGE_TAG="$GITHUB_SHA" \
@@ -253,8 +344,18 @@ jobs:
             --env-file .env \
             build mailserver
 
-          echo "Imagem criada:"
-          docker image inspect "$IMAGE_NAME:$GITHUB_SHA" \
+          echo ""
+          echo "Validando imagem criada..."
+
+          docker image inspect \
+            "$IMAGE_NAME:$GITHUB_SHA" \
+            > /dev/null
+
+          echo ""
+          echo "Imagem criada com sucesso:"
+
+          docker image inspect \
+            "$IMAGE_NAME:$GITHUB_SHA" \
             --format '{{.RepoTags}}'
 
 
@@ -268,6 +369,10 @@ jobs:
         run: |
           set -e
 
+          echo "=============================================="
+          echo "Deploy"
+          echo "=============================================="
+
           echo "Subindo versão:"
           echo "$GITHUB_SHA"
 
@@ -277,7 +382,9 @@ jobs:
             up -d \
             --no-build
 
-          echo "Containers:"
+          echo ""
+          echo "Containers após deploy:"
+
           docker compose \
             --env-file .env \
             ps
@@ -293,7 +400,12 @@ jobs:
         run: |
           set -e
 
-          echo "Aguardando AnInfo.MailServer..."
+          echo "=============================================="
+          echo "Health Check"
+          echo "=============================================="
+
+          echo "Aguardando:"
+          echo "http://127.0.0.1:8085/health"
 
           for i in $(seq 1 30); do
 
@@ -304,26 +416,33 @@ jobs:
               http://127.0.0.1:8085/health \
               > /dev/null; then
 
+              echo ""
               echo "=============================================="
               echo " DEPLOY APROVADO"
-              echo " Health check OK"
-              echo " Commit: $GITHUB_SHA"
+              echo "=============================================="
+              echo "Health check: OK"
+              echo "Commit:"
+              echo "$GITHUB_SHA"
               echo "=============================================="
 
               exit 0
             fi
 
-            echo "Health ainda indisponível - tentativa $i/30"
+            echo "Health indisponível - tentativa $i/30"
+
             sleep 5
           done
 
+          echo ""
           echo "=============================================="
           echo " DEPLOY COM FALHA"
-          echo " Health check não respondeu corretamente."
           echo "=============================================="
-
+          echo "Health check não respondeu corretamente."
           echo ""
+
           echo "Logs do MailServer:"
+          echo ""
+
           docker compose \
             --env-file .env \
             logs \
@@ -350,15 +469,30 @@ jobs:
 
           echo "$GITHUB_SHA" > "$DEPLOY_DIR/.deployed-sha"
 
+          echo ""
           echo "=============================================="
-          echo " Deploy registrado"
-          echo " Atual    : $GITHUB_SHA"
-          echo " Anterior : ${PREVIOUS_SHA:-nenhuma}"
+          echo "DEPLOY REGISTRADO"
+          echo "=============================================="
+
+          echo "Atual:"
+          echo "$GITHUB_SHA"
+
+          echo ""
+
+          if [ -n "$PREVIOUS_SHA" ]; then
+            echo "Anterior:"
+            echo "$PREVIOUS_SHA"
+          else
+            echo "Anterior: nenhuma"
+          fi
+
           echo "=============================================="
 
 
       # ============================================================
       # ROLLBACK AUTOMÁTICO
+      # Só acontece se o container chegou a ser implantado
+      # e algum passo posterior falhou.
       # ============================================================
 
       - name: Rollback automático
@@ -369,37 +503,60 @@ jobs:
 
           PREVIOUS_SHA="${{ steps.previous.outputs.previous_sha }}"
 
+          echo ""
           echo "=============================================="
-          echo " ROLLBACK AUTOMÁTICO"
+          echo "ROLLBACK AUTOMÁTICO"
           echo "=============================================="
 
           if [ -z "$PREVIOUS_SHA" ]; then
+
             echo "Não existe versão anterior registrada."
-            echo "Primeiro deploy não pode ser revertido automaticamente."
+            echo "Este é o primeiro deploy."
+            echo ""
+            echo "O container com falha será parado."
+
+            MAILSERVER_IMAGE_TAG="$GITHUB_SHA" \
+            docker compose \
+              --env-file .env \
+              stop mailserver || true
+
             exit 0
+
           fi
 
           echo "Versão anterior:"
           echo "$PREVIOUS_SHA"
 
+          echo ""
+          echo "Verificando imagem anterior..."
+
           if ! docker image inspect \
             "$IMAGE_NAME:$PREVIOUS_SHA" \
             > /dev/null 2>&1; then
 
-            echo "ERRO: imagem anterior não encontrada:"
+            echo ""
+            echo "ERRO:"
+            echo "Imagem anterior não encontrada:"
             echo "$IMAGE_NAME:$PREVIOUS_SHA"
 
             exit 1
           fi
 
-          if [ -f "$DEPLOY_DIR/.rollback/docker-compose.yml" ]; then
-            echo "Restaurando docker-compose.yml anterior..."
+          echo "Imagem anterior encontrada."
 
-            cp "$DEPLOY_DIR/.rollback/docker-compose.yml" \
-               "$DEPLOY_DIR/docker-compose.yml"
+          echo ""
+          echo "Restaurando configuração anterior..."
+
+          if [ -f "$DEPLOY_DIR/.rollback/docker-compose.yml" ]; then
+
+            cp \
+              "$DEPLOY_DIR/.rollback/docker-compose.yml" \
+              "$DEPLOY_DIR/docker-compose.yml"
+
           fi
 
-          echo "Retornando para imagem:"
+          echo ""
+          echo "Retornando para:"
           echo "$IMAGE_NAME:$PREVIOUS_SHA"
 
           MAILSERVER_IMAGE_TAG="$PREVIOUS_SHA" \
@@ -408,7 +565,8 @@ jobs:
             up -d \
             --no-build
 
-          echo "Aguardando health da versão anterior..."
+          echo ""
+          echo "Aguardando health da versão restaurada..."
 
           for i in $(seq 1 30); do
 
@@ -419,20 +577,28 @@ jobs:
               http://127.0.0.1:8085/health \
               > /dev/null; then
 
+              echo ""
               echo "=============================================="
-              echo " ROLLBACK CONCLUÍDO"
-              echo " Versão restaurada: $PREVIOUS_SHA"
+              echo "ROLLBACK CONCLUÍDO"
+              echo "=============================================="
+              echo "Versão restaurada:"
+              echo "$PREVIOUS_SHA"
               echo "=============================================="
 
               exit 0
             fi
 
             echo "Tentativa de rollback $i/30..."
+
             sleep 5
           done
 
-          echo "ERRO CRÍTICO:"
-          echo "A versão anterior também não respondeu ao health check."
+          echo ""
+          echo "=============================================="
+          echo "ERRO CRÍTICO"
+          echo "=============================================="
+          echo "A versão anterior também não respondeu."
+          echo ""
 
           docker compose \
             --env-file .env \
@@ -447,21 +613,37 @@ jobs:
       # STATUS FINAL
       # ============================================================
 
-      - name: Status dos containers
+      - name: Status final
         if: always()
         working-directory: /srv/aninfo/apps/AnInfo.MailServer
         run: |
+          echo ""
           echo "=============================================="
-          echo " STATUS FINAL"
+          echo "STATUS FINAL"
           echo "=============================================="
+
+          echo ""
+          echo "Containers:"
 
           docker compose \
             --env-file .env \
             ps || true
 
           echo ""
-          echo "Imagens disponíveis:"
+          echo "Imagens do AnInfo MailServer:"
 
           docker images "$IMAGE_NAME" \
             --format 'table {{.Repository}}\t{{.Tag}}\t{{.CreatedSince}}\t{{.Size}}' \
             || true
+
+          echo ""
+          echo "Versão registrada:"
+
+          if [ -f "$DEPLOY_DIR/.deployed-sha" ]; then
+            cat "$DEPLOY_DIR/.deployed-sha"
+          else
+            echo "Nenhuma."
+          fi
+
+          echo ""
+          echo "=============================================="
