@@ -5,30 +5,463 @@ on:
     branches:
       - main
 
+  workflow_dispatch:
+
+concurrency:
+  group: aninfo-mailserver-deploy
+  cancel-in-progress: false
+
 jobs:
-  test-runner:
+  deploy:
+    name: Test, Build and Deploy
     runs-on: self-hosted
+    timeout-minutes: 30
+
+    env:
+      DEPLOY_DIR: /srv/aninfo/apps/AnInfo.MailServer
+      IMAGE_NAME: aninfo-mailserver
+      TEST_POSTGRES_CONTAINER: aninfo-mailserver-ci-postgres
 
     steps:
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Identificar servidor
-        run: |
-          echo "================================"
-          echo "AnInfo MailServer"
-          echo "================================"
-          echo "Servidor: $(hostname)"
-          echo "Usuario: $(whoami)"
-          echo "Commit: $GITHUB_SHA"
-          echo "Branch: $GITHUB_REF"
-          echo "Data: $(date)"
-          echo "================================"
 
-      - name: Verificar Docker
+      # ============================================================
+      # INFORMAÇÕES DO DEPLOY
+      # ============================================================
+
+      - name: Informações do deploy
         run: |
-          docker --version
+          echo "=============================================="
+          echo " AnInfo MailServer - Deploy"
+          echo "=============================================="
+          echo "Servidor : $(hostname)"
+          echo "Usuário  : $(whoami)"
+          echo "Commit   : $GITHUB_SHA"
+          echo "Branch   : $GITHUB_REF"
+          echo "Data     : $(date)"
+          echo "=============================================="
+
+
+      # ============================================================
+      # VALIDAÇÕES DO SERVIDOR
+      # ============================================================
+
+      - name: Validar ambiente do servidor
+        run: |
+          set -e
+
+          echo "Verificando Docker..."
+          docker info > /dev/null
+
+          echo "Verificando Docker Compose..."
           docker compose version
 
-      - name: Teste concluido
-        run: echo "Runner AnInfo funcionando!"
+          echo "Verificando .NET..."
+          dotnet --version
+
+          echo "Verificando rsync..."
+          rsync --version | head -n 1
+
+          echo "Verificando curl..."
+          curl --version | head -n 1
+
+          echo "Verificando diretório de deploy..."
+          test -d "$DEPLOY_DIR"
+
+          echo "Verificando arquivo .env..."
+          test -f "$DEPLOY_DIR/.env"
+
+          echo "Verificando permissões do .env..."
+          ENV_PERMISSION=$(stat -c "%a" "$DEPLOY_DIR/.env")
+
+          if [ "$ENV_PERMISSION" != "600" ]; then
+            echo "ERRO: $DEPLOY_DIR/.env deve possuir permissão 600."
+            echo "Permissão atual: $ENV_PERMISSION"
+            exit 1
+          fi
+
+          echo "Verificando rede Docker compartilhada..."
+          docker network inspect aninfo_shared > /dev/null
+
+          echo "Ambiente validado com sucesso."
+
+
+      # ============================================================
+      # RESTORE
+      # ============================================================
+
+      - name: Restaurar dependências
+        run: |
+          set -e
+
+          dotnet restore AnInfo.MailServer.sln
+
+
+      # ============================================================
+      # POSTGRESQL TEMPORÁRIO PARA TESTES
+      # ============================================================
+
+      - name: Preparar PostgreSQL de testes
+        run: |
+          set -e
+
+          echo "Removendo eventual container antigo de testes..."
+          docker rm -f "$TEST_POSTGRES_CONTAINER" 2>/dev/null || true
+
+          echo "Iniciando PostgreSQL temporário..."
+
+          docker run -d \
+            --name "$TEST_POSTGRES_CONTAINER" \
+            -e POSTGRES_DB=aninfo_mail \
+            -e POSTGRES_USER=aninfo \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 127.0.0.1:5433:5432 \
+            postgres:17.10-bookworm
+
+          echo "Aguardando PostgreSQL ficar disponível..."
+
+          for i in $(seq 1 30); do
+            if docker exec "$TEST_POSTGRES_CONTAINER" \
+              pg_isready -U aninfo -d aninfo_mail > /dev/null 2>&1; then
+
+              echo "PostgreSQL de testes pronto."
+              exit 0
+            fi
+
+            echo "Tentativa $i/30..."
+            sleep 2
+          done
+
+          echo "ERRO: PostgreSQL de testes não ficou disponível."
+          docker logs "$TEST_POSTGRES_CONTAINER" || true
+          exit 1
+
+
+      # ============================================================
+      # TESTES
+      # ============================================================
+
+      - name: Executar testes
+        env:
+          ConnectionStrings__DefaultConnection: "Host=127.0.0.1;Port=5433;Database=aninfo_mail;Username=aninfo"
+        run: |
+          set -e
+
+          dotnet test \
+            tests/AnInfo.MailServer.Tests/AnInfo.MailServer.Tests.csproj \
+            -c Release \
+            --no-restore \
+            --verbosity normal
+
+
+      # ============================================================
+      # LIMPEZA DO POSTGRESQL DE TESTES
+      # ============================================================
+
+      - name: Remover PostgreSQL de testes
+        if: always()
+        run: |
+          docker rm -f "$TEST_POSTGRES_CONTAINER" 2>/dev/null || true
+
+
+      # ============================================================
+      # REGISTRAR VERSÃO ANTERIOR
+      # ============================================================
+
+      - name: Identificar versão anterior
+        id: previous
+        run: |
+          set -e
+
+          PREVIOUS_SHA=""
+
+          if [ -f "$DEPLOY_DIR/.deployed-sha" ]; then
+            PREVIOUS_SHA=$(cat "$DEPLOY_DIR/.deployed-sha")
+          fi
+
+          echo "previous_sha=$PREVIOUS_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$PREVIOUS_SHA" ]; then
+            echo "Versão atualmente implantada: $PREVIOUS_SHA"
+          else
+            echo "Primeiro deploy detectado."
+          fi
+
+
+      # ============================================================
+      # BACKUP DO COMPOSE ANTERIOR
+      # ============================================================
+
+      - name: Preservar configuração anterior
+        run: |
+          set -e
+
+          mkdir -p "$DEPLOY_DIR/.rollback"
+
+          if [ -f "$DEPLOY_DIR/docker-compose.yml" ]; then
+            cp "$DEPLOY_DIR/docker-compose.yml" \
+               "$DEPLOY_DIR/.rollback/docker-compose.yml"
+          fi
+
+
+      # ============================================================
+      # COPIAR NOVA VERSÃO
+      # ============================================================
+
+      - name: Atualizar arquivos de deploy
+        run: |
+          set -e
+
+          echo "Copiando nova versão para:"
+          echo "$DEPLOY_DIR"
+
+          rsync -a \
+            --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.env' \
+            --exclude '.deployed-sha' \
+            --exclude '.previous-sha' \
+            --exclude '.rollback/' \
+            --exclude '**/bin/' \
+            --exclude '**/obj/' \
+            ./ "$DEPLOY_DIR/"
+
+          echo "Arquivos atualizados."
+
+
+      # ============================================================
+      # BUILD VERSIONADO
+      # ============================================================
+
+      - name: Build da imagem
+        working-directory: /srv/aninfo/apps/AnInfo.MailServer
+        run: |
+          set -e
+
+          echo "Gerando imagem:"
+          echo "$IMAGE_NAME:$GITHUB_SHA"
+
+          MAILSERVER_IMAGE_TAG="$GITHUB_SHA" \
+          docker compose \
+            --env-file .env \
+            build mailserver
+
+          echo "Imagem criada:"
+          docker image inspect "$IMAGE_NAME:$GITHUB_SHA" \
+            --format '{{.RepoTags}}'
+
+
+      # ============================================================
+      # DEPLOY
+      # ============================================================
+
+      - name: Subir nova versão
+        id: deployment
+        working-directory: /srv/aninfo/apps/AnInfo.MailServer
+        run: |
+          set -e
+
+          echo "Subindo versão:"
+          echo "$GITHUB_SHA"
+
+          MAILSERVER_IMAGE_TAG="$GITHUB_SHA" \
+          docker compose \
+            --env-file .env \
+            up -d \
+            --no-build
+
+          echo "Containers:"
+          docker compose \
+            --env-file .env \
+            ps
+
+
+      # ============================================================
+      # HEALTH CHECK
+      # ============================================================
+
+      - name: Validar health check
+        id: health
+        working-directory: /srv/aninfo/apps/AnInfo.MailServer
+        run: |
+          set -e
+
+          echo "Aguardando AnInfo.MailServer..."
+
+          for i in $(seq 1 30); do
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              http://127.0.0.1:8085/health \
+              > /dev/null; then
+
+              echo "=============================================="
+              echo " DEPLOY APROVADO"
+              echo " Health check OK"
+              echo " Commit: $GITHUB_SHA"
+              echo "=============================================="
+
+              exit 0
+            fi
+
+            echo "Health ainda indisponível - tentativa $i/30"
+            sleep 5
+          done
+
+          echo "=============================================="
+          echo " DEPLOY COM FALHA"
+          echo " Health check não respondeu corretamente."
+          echo "=============================================="
+
+          echo ""
+          echo "Logs do MailServer:"
+          docker compose \
+            --env-file .env \
+            logs \
+            --tail=150 \
+            mailserver || true
+
+          exit 1
+
+
+      # ============================================================
+      # REGISTRAR DEPLOY COM SUCESSO
+      # ============================================================
+
+      - name: Registrar versão implantada
+        if: success()
+        run: |
+          set -e
+
+          PREVIOUS_SHA="${{ steps.previous.outputs.previous_sha }}"
+
+          if [ -n "$PREVIOUS_SHA" ]; then
+            echo "$PREVIOUS_SHA" > "$DEPLOY_DIR/.previous-sha"
+          fi
+
+          echo "$GITHUB_SHA" > "$DEPLOY_DIR/.deployed-sha"
+
+          echo "=============================================="
+          echo " Deploy registrado"
+          echo " Atual    : $GITHUB_SHA"
+          echo " Anterior : ${PREVIOUS_SHA:-nenhuma}"
+          echo "=============================================="
+
+
+      # ============================================================
+      # ROLLBACK AUTOMÁTICO
+      # ============================================================
+
+      - name: Rollback automático
+        if: failure() && steps.deployment.outcome == 'success'
+        working-directory: /srv/aninfo/apps/AnInfo.MailServer
+        run: |
+          set -e
+
+          PREVIOUS_SHA="${{ steps.previous.outputs.previous_sha }}"
+
+          echo "=============================================="
+          echo " ROLLBACK AUTOMÁTICO"
+          echo "=============================================="
+
+          if [ -z "$PREVIOUS_SHA" ]; then
+            echo "Não existe versão anterior registrada."
+            echo "Primeiro deploy não pode ser revertido automaticamente."
+            exit 0
+          fi
+
+          echo "Versão anterior:"
+          echo "$PREVIOUS_SHA"
+
+          if ! docker image inspect \
+            "$IMAGE_NAME:$PREVIOUS_SHA" \
+            > /dev/null 2>&1; then
+
+            echo "ERRO: imagem anterior não encontrada:"
+            echo "$IMAGE_NAME:$PREVIOUS_SHA"
+
+            exit 1
+          fi
+
+          if [ -f "$DEPLOY_DIR/.rollback/docker-compose.yml" ]; then
+            echo "Restaurando docker-compose.yml anterior..."
+
+            cp "$DEPLOY_DIR/.rollback/docker-compose.yml" \
+               "$DEPLOY_DIR/docker-compose.yml"
+          fi
+
+          echo "Retornando para imagem:"
+          echo "$IMAGE_NAME:$PREVIOUS_SHA"
+
+          MAILSERVER_IMAGE_TAG="$PREVIOUS_SHA" \
+          docker compose \
+            --env-file .env \
+            up -d \
+            --no-build
+
+          echo "Aguardando health da versão anterior..."
+
+          for i in $(seq 1 30); do
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              http://127.0.0.1:8085/health \
+              > /dev/null; then
+
+              echo "=============================================="
+              echo " ROLLBACK CONCLUÍDO"
+              echo " Versão restaurada: $PREVIOUS_SHA"
+              echo "=============================================="
+
+              exit 0
+            fi
+
+            echo "Tentativa de rollback $i/30..."
+            sleep 5
+          done
+
+          echo "ERRO CRÍTICO:"
+          echo "A versão anterior também não respondeu ao health check."
+
+          docker compose \
+            --env-file .env \
+            logs \
+            --tail=150 \
+            mailserver || true
+
+          exit 1
+
+
+      # ============================================================
+      # STATUS FINAL
+      # ============================================================
+
+      - name: Status dos containers
+        if: always()
+        working-directory: /srv/aninfo/apps/AnInfo.MailServer
+        run: |
+          echo "=============================================="
+          echo " STATUS FINAL"
+          echo "=============================================="
+
+          docker compose \
+            --env-file .env \
+            ps || true
+
+          echo ""
+          echo "Imagens disponíveis:"
+
+          docker images "$IMAGE_NAME" \
+            --format 'table {{.Repository}}\t{{.Tag}}\t{{.CreatedSince}}\t{{.Size}}' \
+            || true
