@@ -1,0 +1,34 @@
+name: Deploy AnInfo MailServer
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-runner:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Identificar servidor
+        run: |
+          echo "================================"
+          echo "AnInfo MailServer"
+          echo "================================"
+          echo "Servidor: $(hostname)"
+          echo "Usuario: $(whoami)"
+          echo "Commit: $GITHUB_SHA"
+          echo "Branch: $GITHUB_REF"
+          echo "Data: $(date)"
+          echo "================================"
+
+      - name: Verificar Docker
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Teste concluido
+        run: echo "Runner AnInfo funcionando!"
