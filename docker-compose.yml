@@ -33,8 +33,8 @@ services:
 
     environment:
       # PostgreSQL
-      # O banco NÃO é acessado pelo Windows.
-      # A comunicação acontece exclusivamente pela rede Docker.
+      # O banco NÃO é acessado diretamente pelo host.
+      # A comunicação acontece exclusivamente pela rede Docker privada.
       ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=aninfo_mail;Username=aninfo;Password=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
 
       # SMTP Server
@@ -74,11 +74,15 @@ services:
 
     networks:
       - mailserver_private
+      - aninfo_shared
 
 
 networks:
   mailserver_private:
     driver: bridge
+
+  aninfo_shared:
+    external: true
 
 
 volumes:
